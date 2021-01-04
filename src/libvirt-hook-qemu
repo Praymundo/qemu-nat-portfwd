@@ -1,0 +1,73 @@
+#!/bin/bash
+set -e
+
+## src: https://wiki.libvirt.org/page/Networking
+## Must be placed at: /etc/libvirt/hooks/qemu (qemu = filename)
+
+## src: https://stackoverflow.com/questions/10775863/best-way-to-check-if-a-iptables-userchain-exist
+## Check if a chain exists
+function chain_exists() {
+  local chain_name="$1" ; shift
+  [ $# -eq 1 ] && local table="--table $1"
+  /sbin/iptables $table -n --list "$chain_name" >/dev/null 2>&1
+  if [ $? -eq 0 ]; then
+    return 0 # OK
+  fi
+  return 1 # ERROR
+}
+
+## Create a chain to be used later
+function create_chain() {
+  local CHAIN=$1
+  local NETWORK=$2
+  local NETWORK_IP=$3
+  if ! chain_exists "${CHAIN}"; then
+    # Create both chains (normal and NAT)
+    /sbin/iptables -N ${CHAIN}
+    /sbin/iptables -t nat -N ${CHAIN}
+    # Pass the forward rule to our chain
+    /sbin/iptables -I FORWARD -j ${CHAIN}
+    # Pass the preroute rule to our chain
+    /sbin/iptables -t nat -I PREROUTING -m addrtype --dst-type LOCAL -j ${CHAIN}
+    # Pass the postroute rule to our chain
+    /sbin/iptables -t nat -I POSTROUTING -s ${NETWORK_IP} ! -o ${NETWORK} -j MASQUERADE
+    # Fill our normal chain with default rules
+    /sbin/iptables -A ${CHAIN} -i ${NETWORK} --src ${NETWORK_IP} -j ACCEPT
+    /sbin/iptables -A ${CHAIN} -o ${NETWORK} --dst ${NETWORK_IP} -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    /sbin/iptables -A ${CHAIN} -j RETURN
+    # Fill our nat chain with default rules
+    /sbin/iptables -t nat -A ${CHAIN} -i ${NETWORK} -j RETURN
+  fi
+}
+
+## Create a rule for one port
+function create_rule() {
+  local VM_NAME=$1
+  local VM_ACTION=$2
+  local VM_CHECK=$3
+  local CHAIN=$4
+  local NETWORK=$5
+  local HOST_PORT=$6
+  local GUEST_IP=$7
+  local GUEST_PORT=$8
+  local PROTOCOL=$9
+  if chain_exists "${CHAIN}"; then
+    if [ "${VM_ACTION}" = "stopped" ] || [ "${VM_ACTION}" = "reconnect" ]; then
+          /sbin/iptables -D ${CHAIN} -o $NETWORK -p $PROTOCOL -d $GUEST_IP --dport $GUEST_PORT -j ACCEPT >/dev/null 2>&1 || true
+          /sbin/iptables -t nat -D POSTROUTING -s $GUEST_IP/32 -d $GUEST_IP/32 -p $PROTOCOL -m $PROTOCOL --dport $GUEST_PORT -j MASQUERADE >/dev/null 2>&1 || true
+          /sbin/iptables -t nat -D ${CHAIN} -p $PROTOCOL --dport $HOST_PORT -j DNAT --to $GUEST_IP:$GUEST_PORT >/dev/null 2>&1 || true
+     fi
+     if [ "${VM_ACTION}" = "start" ] || [ "${VM_ACTION}" = "reconnect" ]; then
+          /sbin/iptables -I ${CHAIN} -o $NETWORK -p $PROTOCOL -d $GUEST_IP --dport $GUEST_PORT -j ACCEPT >/dev/null 2>&1
+          /sbin/iptables -t nat -A POSTROUTING -s $GUEST_IP/32 -d $GUEST_IP/32 -p $PROTOCOL -m $PROTOCOL --dport $GUEST_PORT -j MASQUERADE >/dev/null 2>&1
+          /sbin/iptables -t nat -I ${CHAIN} -p $PROTOCOL --dport $HOST_PORT -j DNAT --to $GUEST_IP:$GUEST_PORT >/dev/null 2>&1
+     fi
+  fi
+}
+
+CHAIN_NAME="QEMU-USER"
+NETWORK=virbr1
+NETWORK_IP=192.168.120.0/24
+
+create_chain "${CHAIN_NAME}" "${NETWORK}" "${NETWORK_IP}"
+create_rule "$1" "$2" "ubuntu-server" "${CHAIN_NAME}" "${NETWORK}" "2222" "192.168.120.10" "22" "tcp"
